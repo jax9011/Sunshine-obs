@@ -1,0 +1,1297 @@
+From b17fa38d4815ec7ba7bb84c83fd5b2392a73deb7 Mon Sep 17 00:00:00 2001
+From: fork-bot <a@b.c>
+Date: Fri, 13 Nov 2026 08:47:45 +0000
+Subject: [PATCH] Add OBS window grid capture (capture = obs)
+
+Up to 10 OBS windows are arranged in a grid by the obs-moonlight-grid plugin and
+streamed as one video through a GPU shared texture. Touch, click and drag on the
+grid are sent to the matching real window.
+---
+ cmake/compile_definitions/windows.cmake |   6 +
+ docs/obs_grid.md                        |  23 ++
+ src/input.cpp                           |  50 +++-
+ src/platform/windows/display.h          | 106 ++++++++
+ src/platform/windows/display_base.cpp   |  26 +-
+ src/platform/windows/display_obs.cpp    | 192 +++++++++++++++
+ src/platform/windows/display_vram.cpp   |  64 +++++
+ src/platform/windows/obs_grid.cpp       | 307 ++++++++++++++++++++++++
+ src/platform/windows/obs_grid.h         |  37 +++
+ src/platform/windows/obs_grid_input.h   |  55 +++++
+ src/platform/windows/obs_grid_layout.h  | 127 ++++++++++
+ src/platform/windows/obs_grid_shm.h     |  68 ++++++
+ tests/unit/test_obs_grid_layout.cpp     |  58 +++++
+ 13 files changed, 1116 insertions(+), 3 deletions(-)
+ create mode 100644 docs/obs_grid.md
+ create mode 100644 src/platform/windows/display_obs.cpp
+ create mode 100644 src/platform/windows/obs_grid.cpp
+ create mode 100644 src/platform/windows/obs_grid.h
+ create mode 100644 src/platform/windows/obs_grid_input.h
+ create mode 100644 src/platform/windows/obs_grid_layout.h
+ create mode 100644 src/platform/windows/obs_grid_shm.h
+ create mode 100644 tests/unit/test_obs_grid_layout.cpp
+
+diff --git a/cmake/compile_definitions/windows.cmake b/cmake/compile_definitions/windows.cmake
+index a7c18bd..0247c5d 100644
+--- a/cmake/compile_definitions/windows.cmake
++++ b/cmake/compile_definitions/windows.cmake
+@@ -72,6 +72,12 @@ set(PLATFORM_TARGET_FILES
+         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_vram.cpp"
+         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_ram.cpp"
+         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_wgc.cpp"
++        "${CMAKE_SOURCE_DIR}/src/platform/windows/display_obs.cpp"
++        "${CMAKE_SOURCE_DIR}/src/platform/windows/obs_grid.cpp"
++        "${CMAKE_SOURCE_DIR}/src/platform/windows/obs_grid.h"
++        "${CMAKE_SOURCE_DIR}/src/platform/windows/obs_grid_input.h"
++        "${CMAKE_SOURCE_DIR}/src/platform/windows/obs_grid_layout.h"
++        "${CMAKE_SOURCE_DIR}/src/platform/windows/obs_grid_shm.h"
+         "${CMAKE_SOURCE_DIR}/src/platform/windows/audio.cpp"
+         "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.cpp"
+         "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.h"
+diff --git a/docs/obs_grid.md b/docs/obs_grid.md
+new file mode 100644
+index 0000000..a3491b0
+--- /dev/null
++++ b/docs/obs_grid.md
+@@ -0,0 +1,23 @@
++# OBS window grid capture (`capture = obs`)
++
++Streams up to 10 windows at the same time to a normal Moonlight client. OBS takes the windows, the
++`obs-moonlight-grid` plugin arranges them in a grid on a canvas that has the size of the Moonlight
++stream, and Sunshine encodes that canvas (hardware encoder, no CPU copy) as one video.
++A tap or click on a window of the grid is sent to the real window on the PC.
++
++## Setup
++1. Install the plugin DLL in OBS (`obs-plugins/64bit/obs-moonlight-grid.dll`). Start OBS.
++2. OBS creates a scene named **Moonlight**. Add *Window Capture* sources to it (up to 10).
++   The eye icon switches a window on or off, the order of the list is the order of the grid.
++3. `sunshine.conf`: `capture = obs`
++4. Start a stream from Moonlight (any app entry, e.g. Desktop).
++
++If OBS is not running Sunshine writes a warning to its log and streams the normal capture.
++
++## Notes
++* OBS and Sunshine must use the same GPU. OBS must use the Direct3D 11 renderer.
++* Set OBS to 60 FPS (Settings > Video) for a smooth 60 FPS stream.
++* HDR is not supported in this mode.
++* A click raises the window under the finger, so keyboard input goes to it.
++* Minimised or off-screen windows are restored when touched.
++* Windows run as administrator can only be controlled if Sunshine runs as administrator too.
+diff --git a/src/input.cpp b/src/input.cpp
+index 1facd6a..b148d44 100644
+--- a/src/input.cpp
++++ b/src/input.cpp
+@@ -34,6 +34,7 @@ extern "C" {
+ #include "logging.h"
+ #include "platform/common.h"
+ #include "platform/virtualhid_input.h"
++#include "platform/windows/obs_grid_input.h"
+ #include "thread_pool.h"
+ #include "utility.h"
+ 
+@@ -775,6 +776,15 @@ namespace input {
+ 
+     input->mouse_left_button_timeout = DISABLE_LEFT_BUTTON_DELAY;
+     refresh_touch_port(input);
++    if (obsgrid_input::active()) {
++      // OBS window grid: move a virtual pointer on the grid and put the real pointer on the matching window
++      if (input->touch_port) {
++        if (auto mapped = obsgrid_input::map_rel(util::endian::big(packet->deltaX), util::endian::big(packet->deltaY))) {
++          platf::abs_mouse(platf_input, platform_touch_port(input->touch_port), mapped->first, mapped->second);
++        }
++      }
++      return;
++    }
+     if (input->touch_port) {
+       platf::move_mouse(
+         platf_input,
+@@ -908,6 +918,14 @@ namespace input {
+ 
+     auto &touch_port = input->touch_port;
+ 
++    if (obsgrid_input::active()) {
++      // OBS window grid: the point on the grid becomes the matching point on the real window
++      if (auto mapped = obsgrid_input::map_abs(tpcoords->first, tpcoords->second)) {
++        platf::abs_mouse(platf_input, platform_touch_port(touch_port), mapped->first, mapped->second);
++      }
++      return;
++    }
++
+     platf::abs_mouse(platf_input, platform_touch_port(touch_port), tpcoords->first, tpcoords->second);
+   }
+ 
+@@ -932,6 +950,10 @@ namespace input {
+ 
+       mouse_press[button] = !release;
+     }
++    if (obsgrid_input::active()) {
++      // OBS window grid: raise the window under the pointer before the click reaches it
++      release ? obsgrid_input::on_release() : obsgrid_input::on_press();
++    }
+     /**
+      * When Moonlight sends mouse input through absolute coordinates,
+      * it's possible that BUTTON_RIGHT is pressed down immediately after releasing BUTTON_LEFT.
+@@ -1437,7 +1459,25 @@ namespace input {
+       return std::nullopt;
+     }
+ 
+-    auto touch_port = monitor_touch_port(input->touch_port, *coords);
++    std::optional<platf::touch_port_t> touch_port;
++    if (obsgrid_input::active()) {
++      // OBS window grid: the touched point of the grid becomes the matching point of the real window,
++      // expressed as 0..1 over the whole virtual desktop.
++      const float env_w = (float) input->touch_port.env_width;
++      const float env_h = (float) input->touch_port.env_height;
++      if (env_w <= 0.0f || env_h <= 0.0f) {
++        return std::nullopt;
++      }
++      const auto mapped = obsgrid_input::map_abs(coords->first, coords->second);
++      if (!mapped) {
++        return std::nullopt;
++      }
++      coords->first = mapped->first / env_w;
++      coords->second = mapped->second / env_h;
++      touch_port = platf::touch_port_t {0, 0, (int) env_w, (int) env_h, (int) env_w, (int) env_h};
++    } else {
++      touch_port = monitor_touch_port(input->touch_port, *coords);
++    }
+     if (!touch_port) {
+       return std::nullopt;
+     }
+@@ -1468,6 +1508,14 @@ namespace input {
+       return;
+     }
+ 
++    if (obsgrid_input::active()) {
++      if (packet->eventType == LI_TOUCH_EVENT_DOWN) {
++        obsgrid_input::on_press();
++      } else if (packet->eventType == LI_TOUCH_EVENT_UP || packet->eventType == LI_TOUCH_EVENT_CANCEL) {
++        obsgrid_input::on_release();
++      }
++    }
++
+     platf::touch_input_t touch {
+       packet->eventType,
+       pointer_data->rotation,
+diff --git a/src/platform/windows/display.h b/src/platform/windows/display.h
+index 802042e..b56ed54 100644
+--- a/src/platform/windows/display.h
++++ b/src/platform/windows/display.h
+@@ -858,4 +858,110 @@ namespace platf::dxgi {
+      */
+     capture_e release_snapshot() override;
+   };
++  /**
++   * @brief Frame source of the OBS grid capture: the GPU texture shared by the obs-moonlight-grid plugin.
++   *
++   * The plugin draws the grid of windows into a keyed-mutex texture; this object opens that texture on
++   * Sunshine's own D3D11 device and hands frames over without any CPU copy.
++   */
++  class obs_frame_source_t {
++  public:
++    /**
++     * @brief Connect to the plugin, request the canvas size and open the shared texture.
++     *
++     * @param display Display whose D3D11 device is used.
++     * @param config Stream configuration (the canvas gets the stream size).
++     * @return 0 on success; -1 when OBS is not ready (the caller then falls back to normal capture).
++     */
++    int init(display_base_t *display, const ::video::config_t &config);
++    /**
++     * @brief Wait for the next frame and lock the texture for reading.
++     *
++     * @param timeout Maximum time to wait.
++     * @param out Receives the (borrowed) texture.
++     * @return ok, timeout, or reinit when the plugin re-created its texture.
++     */
++    capture_e next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out);
++    /**
++     * @brief Give the texture back to the plugin.
++     */
++    void release_frame();
++
++    int canvas_width {0};  ///< Width of the shared canvas in pixels.
++    int canvas_height {0};  ///< Height of the shared canvas in pixels.
++
++    ~obs_frame_source_t();
++
++  private:
++    texture2d_t texture;  ///< The shared texture opened on Sunshine's device.
++    keyed_mutex_t keyed_mutex;  ///< Keyed mutex of that texture.
++    uint32_t generation {0};  ///< Plugin texture generation we opened.
++    bool held {false};  ///< True while the keyed mutex is acquired.
++  };
++
++  /**
++   * Display backend that reads the OBS window grid with a software encoder.
++   */
++  class display_obs_ram_t: public display_ram_t {
++    obs_frame_source_t source;
++
++  public:
++    /**
++     * @brief Initialize the OBS grid backend.
++     *
++     * @param config Configuration values to apply.
++     * @param display_name Display name.
++     * @return 0 on success; nonzero or negative platform status on failure.
++     */
++    int init(const ::video::config_t &config, const std::string &display_name);
++    /**
++     * @brief Capture a display frame into the provided image object.
++     *
++     * @param pull_free_image_cb Callback that provides an available image buffer.
++     * @param img_out Captured image buffer returned to the streaming pipeline.
++     * @param timeout Maximum time to wait for the operation.
++     * @param cursor_visible Cursor visible (unused: the cursor is part of the window capture).
++     * @return Capture status reported to the streaming pipeline.
++     */
++    capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) override;
++    /**
++     * @brief Release resources associated with the last captured snapshot.
++     *
++     * @return Capture status after releasing the current snapshot.
++     */
++    capture_e release_snapshot() override;
++  };
++
++  /**
++   * Display backend that reads the OBS window grid with a hardware encoder.
++   */
++  class display_obs_vram_t: public display_vram_t {
++    obs_frame_source_t source;
++
++  public:
++    /**
++     * @brief Initialize the OBS grid backend.
++     *
++     * @param config Configuration values to apply.
++     * @param display_name Display name.
++     * @return 0 on success; nonzero or negative platform status on failure.
++     */
++    int init(const ::video::config_t &config, const std::string &display_name);
++    /**
++     * @brief Capture a display frame into the provided image object.
++     *
++     * @param pull_free_image_cb Callback that provides an available image buffer.
++     * @param img_out Captured image buffer returned to the streaming pipeline.
++     * @param timeout Maximum time to wait for the operation.
++     * @param cursor_visible Cursor visible (unused: the cursor is part of the window capture).
++     * @return Capture status reported to the streaming pipeline.
++     */
++    capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) override;
++    /**
++     * @brief Release resources associated with the last captured snapshot.
++     *
++     * @return Capture status after releasing the current snapshot.
++     */
++    capture_e release_snapshot() override;
++  };
+ }  // namespace platf::dxgi
+diff --git a/src/platform/windows/display_base.cpp b/src/platform/windows/display_base.cpp
+index 2a01336..21baba5 100644
+--- a/src/platform/windows/display_base.cpp
++++ b/src/platform/windows/display_base.cpp
+@@ -1027,7 +1027,29 @@ namespace platf {
+    * @param hwdevice_type enables possible use of hardware encoder
+    */
+   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+-    if (config::video.capture == "ddx" || config::video.capture.empty()) {
++    auto capture = config::video.capture;
++
++    // OBS window grid (obs-moonlight-grid plugin). If OBS is not ready, use the normal capture.
++    if (capture == "obs") {
++      if (hwdevice_type == mem_type_e::dxgi) {
++        auto disp = std::make_shared<dxgi::display_obs_vram_t>();
++
++        if (!disp->init(config, display_name)) {
++          return disp;
++        }
++      } else if (hwdevice_type == mem_type_e::system) {
++        auto disp = std::make_shared<dxgi::display_obs_ram_t>();
++
++        if (!disp->init(config, display_name)) {
++          return disp;
++        }
++      }
++
++      BOOST_LOG(warning) << "[obs-grid] OBS capture is not available, using the normal capture instead"sv;
++      capture.clear();
++    }
++
++    if (capture == "ddx" || capture.empty()) {
+       if (hwdevice_type == mem_type_e::dxgi) {
+         auto disp = std::make_shared<dxgi::display_ddup_vram_t>();
+ 
+@@ -1043,7 +1065,7 @@ namespace platf {
+       }
+     }
+ 
+-    if (config::video.capture == "wgc" || config::video.capture.empty()) {
++    if (capture == "wgc" || capture.empty()) {
+       if (hwdevice_type == mem_type_e::dxgi) {
+         auto disp = std::make_shared<dxgi::display_wgc_vram_t>();
+ 
+diff --git a/src/platform/windows/display_obs.cpp b/src/platform/windows/display_obs.cpp
+new file mode 100644
+index 0000000..526a913
+--- /dev/null
++++ b/src/platform/windows/display_obs.cpp
+@@ -0,0 +1,192 @@
++/**
++ * @file src/platform/windows/display_obs.cpp
++ * @brief "obs" capture backend: the video is the window grid produced by the obs-moonlight-grid plugin.
++ *
++ * Enable with `capture = obs` in sunshine.conf. If OBS (with the plugin) is not running when a stream
++ * starts, Sunshine logs a warning and uses its normal capture instead.
++ */
++// standard includes
++#include <chrono>
++#include <thread>
++
++// local includes
++#include "display.h"
++#include "misc.h"
++#include "obs_grid.h"
++#include "obs_grid_input.h"
++#include "src/logging.h"
++
++namespace platf::dxgi {
++  using namespace std::literals;
++
++  int obs_frame_source_t::init(display_base_t *display, const ::video::config_t &config) {
++    if (config.dynamicRange) {
++      BOOST_LOG(warning) << "[obs-grid] HDR is not supported by the OBS grid"sv;
++      return -1;
++    }
++
++    auto *shm = obsgrid_link::open();
++    if (!shm) {
++      return -1;
++    }
++    if (!obsgrid_link::plugin_alive()) {
++      BOOST_LOG(warning) << "[obs-grid] the OBS plugin is not running. Start OBS (with obs-moonlight-grid) before streaming."sv;
++      return -1;
++    }
++
++    uint32_t want_w = (uint32_t) config.width, want_h = (uint32_t) config.height;
++    obsgrid_clamp_canvas(want_w, want_h);
++    obsgrid_link::request(want_w, want_h, (uint32_t) config.framerate);
++    obsgrid_link::heartbeat();
++
++    // The plugin builds a canvas of the requested size on its next frame.
++    bool ready = false;
++    for (int i = 0; i < 200; ++i) {  // up to 4 s
++      obsgrid_link::heartbeat();
++      if (shm->texture_handle && shm->canvas_w == want_w && shm->canvas_h == want_h && obsgrid_link::plugin_alive()) {
++        ready = true;
++        break;
++      }
++      std::this_thread::sleep_for(20ms);
++    }
++    if (!ready) {
++      BOOST_LOG(warning) << "[obs-grid] the OBS plugin did not produce a "sv << want_w << 'x' << want_h << " canvas (is OBS using the D3D11 renderer?)"sv;
++      return -1;
++    }
++
++    generation = shm->texture_gen;
++    const auto handle = reinterpret_cast<HANDLE>((uintptr_t) shm->texture_handle);
++    HRESULT status = display->device->OpenSharedResource(handle, IID_ID3D11Texture2D, (void **) &texture);
++    if (FAILED(status)) {
++      BOOST_LOG(error) << "[obs-grid] cannot open the OBS texture [0x"sv << util::hex(status).to_string_view() << "]. OBS and Sunshine must use the same GPU."sv;
++      return -1;
++    }
++    status = texture->QueryInterface(IID_IDXGIKeyedMutex, (void **) &keyed_mutex);
++    if (FAILED(status)) {
++      BOOST_LOG(error) << "[obs-grid] the OBS texture has no keyed mutex [0x"sv << util::hex(status).to_string_view() << ']';
++      return -1;
++    }
++
++    D3D11_TEXTURE2D_DESC desc;
++    texture->GetDesc(&desc);
++    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
++      BOOST_LOG(error) << "[obs-grid] unexpected OBS texture format "sv << (int) desc.Format;
++      return -1;
++    }
++    canvas_width = (int) desc.Width;
++    canvas_height = (int) desc.Height;
++    obsgrid_input::reset();
++    BOOST_LOG(info) << "[obs-grid] capturing the OBS window grid, "sv << canvas_width << 'x' << canvas_height;
++    return 0;
++  }
++
++  capture_e obs_frame_source_t::next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out) {
++    release_frame();
++    obsgrid_link::heartbeat();
++
++    auto *shm = obsgrid_link::peek();
++    if (!shm || shm->texture_gen != generation) {
++      return capture_e::reinit;  // the plugin made a new texture (size change, OBS restart)
++    }
++
++    const HRESULT status = keyed_mutex->AcquireSync(1, (DWORD) timeout.count());
++    if (status == (HRESULT) WAIT_TIMEOUT) {
++      return capture_e::timeout;
++    }
++    if (FAILED(status)) {
++      BOOST_LOG(warning) << "[obs-grid] AcquireSync failed [0x"sv << util::hex(status).to_string_view() << ']';
++      return capture_e::reinit;
++    }
++    held = true;
++    *out = texture.get();
++    return capture_e::ok;
++  }
++
++  void obs_frame_source_t::release_frame() {
++    if (held) {
++      keyed_mutex->ReleaseSync(0);
++      held = false;
++    }
++  }
++
++  obs_frame_source_t::~obs_frame_source_t() {
++    release_frame();
++  }
++
++  // -----------------------------------------------------------------------------------------
++  // software encoder path
++  // -----------------------------------------------------------------------------------------
++
++  int display_obs_ram_t::init(const ::video::config_t &config, const std::string &display_name) {
++    if (display_base_t::init(config, display_name) || source.init(this, config)) {
++      return -1;
++    }
++
++    // The picture is the grid canvas, not a monitor. Input coordinates arrive in canvas pixels
++    // and are mapped to the real windows by obsgrid_input.
++    width = width_before_rotation = source.canvas_width;
++    height = height_before_rotation = source.canvas_height;
++    offset_x = offset_y = 0;
++    capture_format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    texture.reset();
++    return 0;
++  }
++
++  capture_e display_obs_ram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool) {
++    HRESULT status;
++    ID3D11Texture2D *src = nullptr;
++    auto capture_status = source.next_frame(timeout, &src);
++    if (capture_status != capture_e::ok) {
++      return capture_status;
++    }
++
++    if (texture == nullptr) {
++      D3D11_TEXTURE2D_DESC t {};
++      t.Width = width;
++      t.Height = height;
++      t.MipLevels = 1;
++      t.ArraySize = 1;
++      t.SampleDesc.Count = 1;
++      t.Usage = D3D11_USAGE_STAGING;
++      t.Format = capture_format;
++      t.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++
++      status = device->CreateTexture2D(&t, nullptr, &texture);
++      if (FAILED(status)) {
++        BOOST_LOG(error) << "Failed to create staging texture [0x"sv << util::hex(status).to_string_view() << ']';
++        source.release_frame();
++        return capture_e::capture_error;
++      }
++    }
++
++    device_ctx->CopyResource(texture.get(), src);
++    source.release_frame();  // the plugin may draw the next frame while we read this one
++
++    if (!pull_free_image_cb(img_out)) {
++      return capture_e::interrupted;
++    }
++    auto img = (img_t *) img_out.get();
++
++    if (FAILED(status = device_ctx->Map(texture.get(), 0, D3D11_MAP_READ, 0, &img_info))) {
++      BOOST_LOG(error) << "Failed to map texture [0x"sv << util::hex(status).to_string_view() << ']';
++      return capture_e::capture_error;
++    }
++    if (complete_img(img, false)) {
++      device_ctx->Unmap(texture.get(), 0);
++      img_info.pData = nullptr;
++      return capture_e::capture_error;
++    }
++
++    std::copy_n((std::uint8_t *) img_info.pData, height * img_info.RowPitch, (std::uint8_t *) img->data);
++    device_ctx->Unmap(texture.get(), 0);
++    img_info.pData = nullptr;
++
++    img->frame_timestamp = std::chrono::steady_clock::now();
++    return capture_e::ok;
++  }
++
++  capture_e display_obs_ram_t::release_snapshot() {
++    source.release_frame();
++    return capture_e::ok;
++  }
++}  // namespace platf::dxgi
+diff --git a/src/platform/windows/display_vram.cpp b/src/platform/windows/display_vram.cpp
+index 917c5c3..4eb9c3e 100644
+--- a/src/platform/windows/display_vram.cpp
++++ b/src/platform/windows/display_vram.cpp
+@@ -1922,6 +1922,70 @@ namespace platf::dxgi {
+     return 0;
+   }
+ 
++  /**
++   * OBS window grid (obs-moonlight-grid plugin): copy the shared GPU texture into a snapshot texture.
++   */
++  int display_obs_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
++    if (display_base_t::init(config, display_name) || source.init(this, config)) {
++      return -1;
++    }
++
++    // The picture is the grid canvas, not a monitor (see display_obs_ram_t::init).
++    width = width_before_rotation = source.canvas_width;
++    height = height_before_rotation = source.canvas_height;
++    offset_x = offset_y = 0;
++    capture_format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    return 0;
++  }
++
++  capture_e display_obs_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool) {
++    ID3D11Texture2D *src = nullptr;
++    auto capture_status = source.next_frame(timeout, &src);
++    if (capture_status != capture_e::ok) {
++      return capture_status;
++    }
++
++    D3D11_TEXTURE2D_DESC desc;
++    src->GetDesc(&desc);
++    if (desc.Width != width_before_rotation || desc.Height != height_before_rotation) {
++      source.release_frame();
++      BOOST_LOG(info) << "Capture size changed [" << width << 'x' << height << " -> " << desc.Width << 'x' << desc.Height << ']';
++      return capture_e::reinit;
++    }
++
++    std::shared_ptr<platf::img_t> img;
++    if (!pull_free_image_cb(img)) {
++      source.release_frame();
++      return capture_e::interrupted;
++    }
++
++    auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
++    d3d_img->blank = false;  // image is always ready for capture
++    if (complete_img(d3d_img.get(), false) == 0) {
++      texture_lock_helper lock_helper(d3d_img->capture_mutex.get());
++      if (lock_helper.lock()) {
++        device_ctx->CopyResource(d3d_img->capture_texture.get(), src);
++      } else {
++        BOOST_LOG(error) << "Failed to lock capture texture";
++        source.release_frame();
++        return capture_e::capture_error;
++      }
++    } else {
++      source.release_frame();
++      return capture_e::capture_error;
++    }
++    source.release_frame();  // the plugin may draw the next frame; the copy is already queued
++
++    img_out = img;
++    img_out->frame_timestamp = std::chrono::steady_clock::now();
++    return capture_e::ok;
++  }
++
++  capture_e display_obs_vram_t::release_snapshot() {
++    source.release_frame();
++    return capture_e::ok;
++  }
++
+   std::shared_ptr<platf::img_t> display_vram_t::alloc_img() {
+     auto img = std::make_shared<img_d3d_t>();
+ 
+diff --git a/src/platform/windows/obs_grid.cpp b/src/platform/windows/obs_grid.cpp
+new file mode 100644
+index 0000000..49ade1d
+--- /dev/null
++++ b/src/platform/windows/obs_grid.cpp
+@@ -0,0 +1,307 @@
++/**
++ * @file src/platform/windows/obs_grid.cpp
++ * @brief Shared-memory link to the OBS plugin and the grid -> window input mapping.
++ */
++// standard includes
++#include <algorithm>
++#include <chrono>
++#include <cstring>
++#include <mutex>
++
++// platform includes
++#include <dwmapi.h>
++#include <sddl.h>
++#include <windows.h>
++
++// local includes
++#include "obs_grid.h"
++#include "obs_grid_input.h"
++#include "src/logging.h"
++
++namespace platf::obsgrid_link {
++  using namespace std::literals;
++
++  namespace {
++    std::mutex open_mutex;
++    HANDLE map_handle = nullptr;
++    ObsGridShm *shm_ptr = nullptr;
++  }  // namespace
++
++  ObsGridShm *open() {
++    std::lock_guard lg {open_mutex};
++    if (shm_ptr) {
++      return shm_ptr;
++    }
++
++    PSECURITY_DESCRIPTOR psd = nullptr;
++    // SYSTEM + administrators + the interactive (logged-on) user. Nobody else.
++    ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)", SDDL_REVISION_1, &psd, nullptr);
++    SECURITY_ATTRIBUTES sa {sizeof(sa), psd, FALSE};
++    for (const wchar_t *name : {OBSGRID_SHM_NAME_LOCAL, OBSGRID_SHM_NAME_GLOBAL}) {
++      map_handle = CreateFileMappingW(INVALID_HANDLE_VALUE, psd ? &sa : nullptr, PAGE_READWRITE, 0, OBSGRID_SHM_BYTES, name);
++      if (map_handle) {
++        break;
++      }
++    }
++    if (psd) {
++      LocalFree(psd);
++    }
++    if (!map_handle) {
++      BOOST_LOG(error) << "[obs-grid] CreateFileMapping failed: "sv << GetLastError();
++      return nullptr;
++    }
++    void *p = MapViewOfFile(map_handle, FILE_MAP_ALL_ACCESS, 0, 0, OBSGRID_SHM_BYTES);
++    if (!p) {
++      BOOST_LOG(error) << "[obs-grid] MapViewOfFile failed: "sv << GetLastError();
++      CloseHandle(map_handle);
++      map_handle = nullptr;
++      return nullptr;
++    }
++    auto *s = static_cast<ObsGridShm *>(p);
++    if (s->magic != OBSGRID_MAGIC) {  // first one to arrive initialises the block
++      std::memset(s, 0, OBSGRID_SHM_BYTES);
++      s->version = OBSGRID_VERSION;
++      MemoryBarrier();
++      s->magic = OBSGRID_MAGIC;
++    }
++    if (s->version != OBSGRID_VERSION) {
++      BOOST_LOG(error) << "[obs-grid] shared memory version "sv << s->version << " != "sv << OBSGRID_VERSION << ": update Sunshine and the OBS plugin together"sv;
++      UnmapViewOfFile(p);
++      CloseHandle(map_handle);
++      map_handle = nullptr;
++      return nullptr;
++    }
++    shm_ptr = s;
++    return shm_ptr;
++  }
++
++  ObsGridShm *peek() {
++    return shm_ptr;
++  }
++
++  bool plugin_alive() {
++    auto *s = peek();
++    if (!s || !s->plugin_heartbeat_ms) {
++      return false;
++    }
++    return GetTickCount64() - s->plugin_heartbeat_ms < 2000;
++  }
++
++  void heartbeat() {
++    if (auto *s = peek()) {
++      s->sunshine_heartbeat_ms = GetTickCount64();
++    }
++  }
++
++  void request(uint32_t width, uint32_t height, uint32_t fps) {
++    if (auto *s = peek()) {
++      s->requested_w = width;
++      s->requested_h = height;
++      s->requested_fps = fps;
++    }
++  }
++
++  bool read_layout(layout_t &out) {
++    auto *s = peek();
++    if (!s) {
++      return false;
++    }
++    for (int tries = 0; tries < 20; ++tries) {
++      const uint64_t a = s->layout_seq;
++      if (a & 1) {  // the plugin is writing
++        Sleep(0);
++        continue;
++      }
++      MemoryBarrier();
++      const uint32_t n = std::min<uint32_t>(s->window_count, OBSGRID_MAX_WINDOWS);
++      std::memcpy(out.cells, (const void *) s->cells, sizeof(ObsGridCell) * n);
++      MemoryBarrier();
++      if (s->layout_seq == a) {
++        out.n = n;
++        out.seq = a;
++        return true;
++      }
++    }
++    return false;
++  }
++}  // namespace platf::obsgrid_link
++
++// ---------------------------------------------------------------------------------------------
++// grid -> real window
++// ---------------------------------------------------------------------------------------------
++namespace obsgrid_input {
++  using namespace std::literals;
++
++  namespace {
++    std::mutex state_mutex;
++    platf::obsgrid_link::layout_t layout;
++    int target_index = -1;  // window under the pointer
++    HWND target_hwnd = nullptr;
++    int buttons_down = 0;  // buttons / fingers currently down: a drag may leave the window
++    float virt_x = -1.f, virt_y = -1.f;  // virtual pointer for relative (trackpad) mode, canvas pixels
++    ULONGLONG last_restore[OBSGRID_MAX_WINDOWS] = {};
++
++    bool window_rect(HWND h, bool client_area, RECT &r) {
++      if (!h || !IsWindow(h)) {
++        return false;
++      }
++      if (client_area) {
++        RECT c;
++        POINT p {0, 0};
++        if (!GetClientRect(h, &c) || !ClientToScreen(h, &p)) {
++          return false;
++        }
++        r = {p.x, p.y, p.x + c.right, p.y + c.bottom};
++        return true;
++      }
++      if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)))) {
++        return true;
++      }
++      return GetWindowRect(h, &r) != 0;
++    }
++
++    RECT virtual_screen() {
++      const int x = GetSystemMetrics(SM_XVIRTUALSCREEN), y = GetSystemMetrics(SM_YVIRTUALSCREEN);
++      return {x, y, x + GetSystemMetrics(SM_CXVIRTUALSCREEN), y + GetSystemMetrics(SM_CYVIRTUALSCREEN)};
++    }
++
++    bool on_screen(const RECT &r) {
++      RECT vs = virtual_screen(), out;
++      return IntersectRect(&out, &vs, &r) != 0 && (out.right - out.left) > 8 && (out.bottom - out.top) > 8;
++    }
++
++    // A minimised or off-screen window cannot be captured: bring it back (at most twice a second).
++    void ensure_visible(int index, HWND h) {
++      const ULONGLONG now = GetTickCount64();
++      if (index < 0 || now - last_restore[index] < 500) {
++        return;
++      }
++      last_restore[index] = now;
++      if (IsIconic(h)) {
++        ShowWindow(h, SW_RESTORE);
++      }
++      RECT r;
++      if (GetWindowRect(h, &r) && !on_screen(r)) {
++        const RECT vs = virtual_screen();
++        SetWindowPos(h, nullptr, vs.left + 40, vs.top + 40, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
++      }
++    }
++
++    void raise(HWND h) {
++      if (!h || !IsWindow(h)) {
++        return;
++      }
++      if (IsIconic(h)) {
++        ShowWindow(h, SW_RESTORE);
++      }
++      if (GetForegroundWindow() == h) {
++        return;
++      }
++      const DWORD me = GetCurrentThreadId();
++      const DWORD fg = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
++      const bool attached = fg && fg != me && AttachThreadInput(me, fg, TRUE);
++      SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
++      BringWindowToTop(h);
++      SetForegroundWindow(h);
++      if (attached) {
++        AttachThreadInput(me, fg, FALSE);
++      }
++    }
++
++    std::optional<std::pair<float, float>> map_locked(float cx, float cy) {
++      auto *s = platf::obsgrid_link::peek();
++      if (!s) {
++        return std::nullopt;
++      }
++      if (layout.seq != s->layout_seq || layout.seq == 0) {
++        platf::obsgrid_link::layout_t fresh;
++        if (platf::obsgrid_link::read_layout(fresh)) {
++          layout = fresh;
++        }
++      }
++      if (layout.n == 0) {
++        return std::nullopt;
++      }
++
++      obsgrid::rect_f rects[OBSGRID_MAX_WINDOWS];
++      for (uint32_t i = 0; i < layout.n; ++i) {
++        rects[i] = {layout.cells[i].x, layout.cells[i].y, layout.cells[i].w, layout.cells[i].h};
++      }
++      obsgrid::hit_t hit;
++      if (!obsgrid::hit_test(rects, (int) layout.n, cx, cy, buttons_down > 0, target_index, hit)) {
++        return std::nullopt;  // gutter between windows
++      }
++
++      const ObsGridCell &cell = layout.cells[hit.index];
++      HWND h = reinterpret_cast<HWND>((intptr_t) cell.hwnd);
++      RECT r;
++      if (!h || !window_rect(h, (cell.flags & OBSGRID_FLAG_CLIENT_AREA) != 0, r)) {
++        return std::nullopt;  // window not found (closed, or the plugin has not resolved it yet)
++      }
++      if (IsIconic(h) || !on_screen(r)) {
++        ensure_visible(hit.index, h);
++        return std::nullopt;  // the next event maps normally
++      }
++
++      target_index = hit.index;
++      target_hwnd = h;
++      const float rx = (float) r.left + hit.u * (float) std::max<LONG>(0, r.right - r.left - 1);
++      const float ry = (float) r.top + hit.v * (float) std::max<LONG>(0, r.bottom - r.top - 1);
++      return std::pair<float, float> {rx - (float) GetSystemMetrics(SM_XVIRTUALSCREEN), ry - (float) GetSystemMetrics(SM_YVIRTUALSCREEN)};
++    }
++  }  // namespace
++
++  bool active() {
++    auto *s = platf::obsgrid_link::peek();
++    if (!s || !s->sunshine_heartbeat_ms) {
++      return false;
++    }
++    return GetTickCount64() - s->sunshine_heartbeat_ms < 1500;
++  }
++
++  std::optional<std::pair<float, float>> map_abs(float canvas_x, float canvas_y) {
++    std::lock_guard lg {state_mutex};
++    virt_x = canvas_x;  // keep the relative-mode pointer where the finger / mouse last was
++    virt_y = canvas_y;
++    return map_locked(canvas_x, canvas_y);
++  }
++
++  std::optional<std::pair<float, float>> map_rel(int dx, int dy) {
++    std::lock_guard lg {state_mutex};
++    auto *s = platf::obsgrid_link::peek();
++    if (!s) {
++      return std::nullopt;
++    }
++    const float cw = (float) s->canvas_w, ch = (float) s->canvas_h;
++    if (cw <= 0 || ch <= 0) {
++      return std::nullopt;
++    }
++    if (virt_x < 0) {
++      virt_x = cw * 0.5f;
++      virt_y = ch * 0.5f;
++    }
++    virt_x = std::clamp(virt_x + (float) dx, 0.f, cw - 1.f);
++    virt_y = std::clamp(virt_y + (float) dy, 0.f, ch - 1.f);
++    return map_locked(virt_x, virt_y);
++  }
++
++  void on_press() {
++    std::lock_guard lg {state_mutex};
++    ++buttons_down;
++    raise(target_hwnd);
++  }
++
++  void on_release() {
++    std::lock_guard lg {state_mutex};
++    buttons_down = std::max(0, buttons_down - 1);
++  }
++
++  void reset() {
++    std::lock_guard lg {state_mutex};
++    buttons_down = 0;
++    target_index = -1;
++    target_hwnd = nullptr;
++    virt_x = virt_y = -1.f;
++    layout = {};
++  }
++}  // namespace obsgrid_input
+diff --git a/src/platform/windows/obs_grid.h b/src/platform/windows/obs_grid.h
+new file mode 100644
+index 0000000..f96d987
+--- /dev/null
++++ b/src/platform/windows/obs_grid.h
+@@ -0,0 +1,37 @@
++/**
++ * @file src/platform/windows/obs_grid.h
++ * @brief Link between Sunshine and the obs-moonlight-grid OBS plugin (shared memory block).
++ */
++#pragma once
++
++#include "obs_grid_layout.h"
++#include "obs_grid_shm.h"
++
++#include <cstdint>
++
++namespace platf::obsgrid_link {
++  /** @brief Snapshot of the window grid published by the plugin. */
++  struct layout_t {
++    uint64_t seq = 0;
++    uint32_t n = 0;
++    ObsGridCell cells[OBSGRID_MAX_WINDOWS] = {};
++  };
++
++  /** @brief Open (or create) the shared block. Returns nullptr on failure. */
++  ObsGridShm *open();
++
++  /** @brief The shared block if it is already open, otherwise nullptr (never creates it). */
++  ObsGridShm *peek();
++
++  /** @brief True when the OBS plugin has been alive during the last 2 seconds. */
++  bool plugin_alive();
++
++  /** @brief Tell the plugin that a stream is running (call at least once per second). */
++  void heartbeat();
++
++  /** @brief Tell the plugin how big the canvas must be. */
++  void request(uint32_t width, uint32_t height, uint32_t fps);
++
++  /** @brief Copy the current grid layout. Returns false if the plugin is busy rewriting it. */
++  bool read_layout(layout_t &out);
++}  // namespace platf::obsgrid_link
+diff --git a/src/platform/windows/obs_grid_input.h b/src/platform/windows/obs_grid_input.h
+new file mode 100644
+index 0000000..9ef968b
+--- /dev/null
++++ b/src/platform/windows/obs_grid_input.h
+@@ -0,0 +1,55 @@
++/**
++ * @file src/platform/windows/obs_grid_input.h
++ * @brief Input side of the OBS grid capture: maps a touch/click on the grid to the real PC window.
++ *
++ * Portable header (no Windows includes) so src/input.cpp can use it on every platform.
++ * On non-Windows builds everything is an inert stub.
++ */
++#pragma once
++
++#include <optional>
++#include <utility>
++
++namespace obsgrid_input {
++#ifdef _WIN32
++  /** @brief True while a stream is being captured from the OBS grid. */
++  bool active();
++
++  /**
++   * @brief Map a point of the grid canvas (pixels) to the real screen.
++   * @return Position in pixels relative to the top-left corner of the virtual desktop, or nothing
++   *         when the point is not on a window (the event must then be dropped).
++   */
++  std::optional<std::pair<float, float>> map_abs(float canvas_x, float canvas_y);
++
++  /** @brief Relative mouse movement (trackpad mode): moves a virtual pointer on the grid, then maps it. */
++  std::optional<std::pair<float, float>> map_rel(int dx, int dy);
++
++  /** @brief A button / finger went down: bring the window under the pointer to the front. */
++  void on_press();
++
++  /** @brief A button / finger went up. */
++  void on_release();
++
++  /** @brief Forget pointer state (called whenever a new OBS grid capture starts). */
++  void reset();
++#else
++  inline bool active() {
++    return false;
++  }
++
++  inline std::optional<std::pair<float, float>> map_abs(float, float) {
++    return std::nullopt;
++  }
++
++  inline std::optional<std::pair<float, float>> map_rel(int, int) {
++    return std::nullopt;
++  }
++
++  inline void on_press() {}
++
++  inline void on_release() {}
++
++  inline void reset() {}
++#endif
++}  // namespace obsgrid_input
+diff --git a/src/platform/windows/obs_grid_layout.h b/src/platform/windows/obs_grid_layout.h
+new file mode 100644
+index 0000000..89974e7
+--- /dev/null
++++ b/src/platform/windows/obs_grid_layout.h
+@@ -0,0 +1,127 @@
++// Pure C++17 (no platform dependencies). Shared by the OBS plugin (builds the grid)
++// and by Sunshine (maps a touch/click on the grid back to the right window).
++#pragma once
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++
++namespace obsgrid {
++
++  struct rect_f {
++    float x = 0, y = 0, w = 0, h = 0;
++  };
++
++  struct size_i {
++    int w = 0, h = 0;
++  };
++
++  struct hit_t {
++    int index = -1;  // which window
++    float u = 0;  // 0..1 across the window content (left -> right)
++    float v = 0;  // 0..1 down the window content (top -> bottom)
++  };
++
++  constexpr float kMaxUpscale = 2.0f;  // never blow a small window up more than 2x
++
++  // Scale that fits (sw x sh) inside (cw x ch) keeping the aspect ratio.
++  inline float fit_scale(int sw, int sh, float cw, float ch) {
++    if (sw <= 0 || sh <= 0 || cw <= 0 || ch <= 0) {
++      return 0.f;
++    }
++    return std::min({cw / (float) sw, ch / (float) sh, kMaxUpscale});
++  }
++
++  // Row-major split of n items in `cols` columns; the last row is stretched across the full width.
++  inline int items_in_row(int n, int cols, int row) {
++    const int rows = (n + cols - 1) / cols;
++    return row < rows - 1 ? cols : n - cols * (rows - 1);
++  }
++
++  // Lay out n windows (sizes in src) on a canvas. out[i] = rectangle that window i occupies, in canvas pixels.
++  // The number of columns is chosen to waste the least canvas area.
++  inline void layout(const size_i *src, int n, int canvas_w, int canvas_h, int gap, rect_f *out) {
++    if (n <= 0) {
++      return;
++    }
++    int best_cols = 1;
++    float best_score = -1.f;
++    for (int cols = 1; cols <= n; ++cols) {
++      const int rows = (n + cols - 1) / cols;
++      const float ch = (float) canvas_h / rows - gap;
++      float score = 0.f;
++      for (int i = 0; i < n; ++i) {
++        const int row = i / cols;
++        const float cw = (float) canvas_w / items_in_row(n, cols, row) - gap;
++        const float s = fit_scale(src[i].w, src[i].h, cw, ch);
++        score += s * s * (float) src[i].w * (float) src[i].h;
++      }
++      if (score > best_score + 1.f) {  // ties keep fewer columns
++        best_score = score;
++        best_cols = cols;
++      }
++    }
++
++    const int cols = best_cols;
++    const int rows = (n + cols - 1) / cols;
++    const float cell_h = (float) canvas_h / rows;
++    for (int i = 0; i < n; ++i) {
++      const int row = i / cols;
++      const int in_row = items_in_row(n, cols, row);
++      const int col = i - row * cols;
++      const float cell_w = (float) canvas_w / in_row;
++      const float s = fit_scale(src[i].w, src[i].h, cell_w - gap, cell_h - gap);
++      const float w = (float) src[i].w * s, h = (float) src[i].h * s;
++      out[i].x = std::floor(col * cell_w + (cell_w - w) * 0.5f);
++      out[i].y = std::floor(row * cell_h + (cell_h - h) * 0.5f);
++      out[i].w = std::floor(w);
++      out[i].h = std::floor(h);
++    }
++  }
++
++  // Which window is under canvas point (x, y)?
++  // clamp_nearest = true (used while a button is held, so a drag can leave the window):
++  // the point is pulled to the preferred window, or to the nearest one.
++  inline bool hit_test(const rect_f *rects, int n, float x, float y, bool clamp_nearest, int prefer, hit_t &out) {
++    auto fill = [&](int i) {
++      const rect_f &r = rects[i];
++      out.index = i;
++      out.u = r.w > 0 ? std::clamp((x - r.x) / r.w, 0.f, 1.f) : 0.f;
++      out.v = r.h > 0 ? std::clamp((y - r.y) / r.h, 0.f, 1.f) : 0.f;
++    };
++    for (int i = n - 1; i >= 0; --i) {  // later = drawn on top
++      const rect_f &r = rects[i];
++      if (r.w > 0 && r.h > 0 && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) {
++        fill(i);
++        return true;
++      }
++    }
++    if (!clamp_nearest || n <= 0) {
++      return false;
++    }
++    if (prefer >= 0 && prefer < n && rects[prefer].w > 0) {
++      fill(prefer);
++      return true;
++    }
++    int best = -1;
++    float best_d = 1e30f;
++    for (int i = 0; i < n; ++i) {
++      const rect_f &r = rects[i];
++      if (r.w <= 0 || r.h <= 0) {
++        continue;
++      }
++      const float dx = std::max({r.x - x, 0.f, x - (r.x + r.w)});
++      const float dy = std::max({r.y - y, 0.f, y - (r.y + r.h)});
++      const float d = dx * dx + dy * dy;
++      if (d < best_d) {
++        best_d = d;
++        best = i;
++      }
++    }
++    if (best < 0) {
++      return false;
++    }
++    fill(best);
++    return true;
++  }
++
++}  // namespace obsgrid
+diff --git a/src/platform/windows/obs_grid_shm.h b/src/platform/windows/obs_grid_shm.h
+new file mode 100644
+index 0000000..a9605a4
+--- /dev/null
++++ b/src/platform/windows/obs_grid_shm.h
+@@ -0,0 +1,68 @@
++// Shared between the OBS plugin (obs-moonlight-grid) and Sunshine (display_obs / input hook).
++// A small (<4 KB) shared-memory block; the video itself travels as a GPU shared texture.
++// Whoever starts first creates the mapping (open-or-create), so start order does not matter.
++#pragma once
++#include <stdint.h>
++
++#define OBSGRID_SHM_NAME_LOCAL  L"Local\\SunshineObsGrid"
++#define OBSGRID_SHM_NAME_GLOBAL L"Global\\SunshineObsGrid"
++#define OBSGRID_MAGIC           0x4F424731u  // 'OBG1'
++#define OBSGRID_VERSION         3
++#define OBSGRID_MAX_WINDOWS     10
++#define OBSGRID_MAX_W           3840
++#define OBSGRID_MAX_H           2160
++#define OBSGRID_SCENE_NAME      "Moonlight"  // OBS scene whose visible Window Capture sources are streamed
++
++#define OBSGRID_FLAG_CLIENT_AREA 1u  // the OBS source captures the client area only (not the frame)
++
++#pragma pack(push, 8)
++struct ObsGridCell {
++  float x, y, w, h;  // where the window is drawn inside the canvas (pixels)
++  int32_t src_w, src_h;  // size of the captured window image
++  int64_t hwnd;  // the real PC window (0 = not found, input is ignored)
++  uint32_t flags;
++  uint32_t pad;
++  char name[64];  // OBS source name (UTF-8)
++};
++
++struct ObsGridShm {
++  uint32_t magic;
++  uint32_t version;
++
++  // Sunshine -> plugin
++  volatile uint64_t sunshine_heartbeat_ms;  // GetTickCount64() while a stream is being captured
++  volatile uint32_t requested_w, requested_h;  // wanted canvas size (the client's stream size)
++  volatile uint32_t requested_fps;
++
++  // plugin -> Sunshine
++  volatile uint64_t plugin_heartbeat_ms;  // GetTickCount64(), refreshed ~4x per second
++  volatile uint32_t canvas_w, canvas_h;  // size of the shared texture
++  volatile uint32_t texture_handle;  // legacy DXGI shared handle (keyed-mutex texture), 0 = none
++  volatile uint32_t texture_gen;  // changes whenever the texture is re-created
++  volatile uint64_t frame_seq;  // incremented for each new frame
++
++  // layout (seqlock: odd value = being written)
++  volatile uint64_t layout_seq;
++  uint32_t window_count;
++  uint32_t pad;
++  ObsGridCell cells[OBSGRID_MAX_WINDOWS];
++};
++#pragma pack(pop)
++static_assert(sizeof(ObsGridShm) < 4096, "ObsGridShm must fit one page");
++#define OBSGRID_SHM_BYTES 4096
++
++// Canvas size rule shared by both sides: the client's stream size, even numbers, sane limits.
++#ifdef __cplusplus
++static inline void obsgrid_clamp_canvas(uint32_t &w, uint32_t &h) {
++  if (w < 320 || h < 240 || w > OBSGRID_MAX_W || h > OBSGRID_MAX_H) {
++    w = 1920;
++    h = 1080;
++  }
++  w &= ~1u;
++  h &= ~1u;
++}
++#endif
++
++// Keyed-mutex protocol (no tearing, no extra copies):
++//   plugin :  AcquireSync(0)  -> draw frame -> ReleaseSync(1)
++//   Sunshine: AcquireSync(1)  -> copy frame -> ReleaseSync(0)
+diff --git a/tests/unit/test_obs_grid_layout.cpp b/tests/unit/test_obs_grid_layout.cpp
+new file mode 100644
+index 0000000..9c0d247
+--- /dev/null
++++ b/tests/unit/test_obs_grid_layout.cpp
+@@ -0,0 +1,58 @@
++/**
++ * @file tests/unit/test_obs_grid_layout.cpp
++ * @brief Test src/platform/windows/obs_grid_layout.h (grid layout and hit testing for the OBS capture).
++ */
++// test includes
++#include "../tests_common.h"
++
++// local includes
++#include <src/platform/windows/obs_grid_layout.h>
++
++namespace {
++  bool overlaps(const obsgrid::rect_f &a, const obsgrid::rect_f &b) {
++    return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
++  }
++}  // namespace
++
++TEST(ObsGridLayout, OneToTenWindowsNeverOverlapAndStayInside) {
++  const obsgrid::size_i sizes[10] = {{1280, 720}, {800, 600}, {1920, 1080}, {400, 900}, {1000, 1000}, {640, 480}, {1600, 400}, {300, 300}, {1280, 800}, {2560, 1440}};
++  for (int n = 1; n <= 10; ++n) {
++    obsgrid::rect_f r[10];
++    obsgrid::layout(sizes, n, 1920, 1080, 8, r);
++    for (int i = 0; i < n; ++i) {
++      EXPECT_GT(r[i].w, 0.f);
++      EXPECT_GE(r[i].x, 0.f);
++      EXPECT_GE(r[i].y, 0.f);
++      EXPECT_LE(r[i].x + r[i].w, 1920.f);
++      EXPECT_LE(r[i].y + r[i].h, 1080.f);
++      for (int j = i + 1; j < n; ++j) {
++        EXPECT_FALSE(overlaps(r[i], r[j])) << n << " windows: " << i << " overlaps " << j;
++      }
++    }
++  }
++}
++
++TEST(ObsGridLayout, HitTestReturnsPositionInsideTheWindow) {
++  const obsgrid::size_i sizes[4] = {{800, 600}, {800, 600}, {800, 600}, {800, 600}};
++  obsgrid::rect_f r[4];
++  obsgrid::layout(sizes, 4, 1920, 1080, 8, r);
++  for (int i = 0; i < 4; ++i) {
++    obsgrid::hit_t hit;
++    ASSERT_TRUE(obsgrid::hit_test(r, 4, r[i].x + r[i].w * 0.25f, r[i].y + r[i].h * 0.75f, false, -1, hit));
++    EXPECT_EQ(hit.index, i);
++    EXPECT_NEAR(hit.u, 0.25f, 0.01f);
++    EXPECT_NEAR(hit.v, 0.75f, 0.01f);
++  }
++}
++
++TEST(ObsGridLayout, DragCanLeaveTheWindowButStaysOnIt) {
++  const obsgrid::size_i sizes[2] = {{800, 600}, {800, 600}};
++  obsgrid::rect_f r[2];
++  obsgrid::layout(sizes, 2, 1920, 1080, 8, r);
++  obsgrid::hit_t hit;
++  EXPECT_FALSE(obsgrid::hit_test(r, 2, -50.f, -50.f, false, -1, hit));
++  ASSERT_TRUE(obsgrid::hit_test(r, 2, 1900.f, 5.f, true, 0, hit));
++  EXPECT_EQ(hit.index, 0);
++  EXPECT_FLOAT_EQ(hit.u, 1.f);
++  EXPECT_FLOAT_EQ(hit.v, 0.f);
++}
+-- 
+2.43.0
+
