@@ -1,0 +1,22 @@
+name: Apply OBS grid patch
+permissions: {}
+on:
+  workflow_dispatch:
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply patch
+        run: |
+          git config user.name "fork-bot"
+          git config user.email "fork-bot@users.noreply.github.com"
+          git checkout -B obs-grid
+          git am --3way ./0003-*.patch
+          git log --oneline -3
+      - name: Push branch
+        run: git push --force origin obs-grid
